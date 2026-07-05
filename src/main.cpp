@@ -29,464 +29,230 @@
 
 */
 
+/*
+  RadioLib LoRaWAN ABP - Teste de Eficiência Automatizado
+  - Canal Fixo: 916.8 MHz (via modificação na lib)
+  - Largura de Banda: 125 kHz
+  - Varredura: SF7->SF9->SF12 e 4-20 dBm
+  - Correção: Lógica de contador e reset corrigida.
+*/
 
 #include "configABP.h"
 #include <arduinoFFT.h>
 #include <Wire.h>
 #include <Adafruit_ADS1X15.h>
 #include <U8g2lib.h>
-#define AMOSTRAS (860) //amostras a serem coletadas (amostras mais precisas, mas com maior tempo de execução)
-#define AMAXSENS 100       // A corrente máxima do sensor neste caso é o SCT013, que oferece 30 A máx. a 1000 mV.
-#define MVMAXSENS 512    // MV máximo oferecido pelo sensor em sua corrente máxima suportada
-#define VOLTRED 220       // Tensão da rede
+#include <Adafruit_INA219.h>
 
-Adafruit_ADS1115 ads;  /* Use this for the 16-bit version */
+#define I2C_SDA 21
+#define I2C_SCL 22
 
-float multiplier = 0.010162022;
-float Peficaz;
-float Int_calculada;
+Adafruit_INA219 ina219;
+uint32_t total_sec = 0;
+float total_mA = 0.0;
 
+#define PERIOD_MS (1000 * uplinkIntervalSeconds)
+
+// Variáveis Globais de Controle
 uint32_t counter = 0;
+uint packet_counter = 0;
 
-float med_Ieficaz(float *frequency);
-float inital_med_Ieficaz();
+// Lista de potências (em dBm) para o teste dinâmico
+static const int8_t testPowers[] = {4, 6, 8, 10, 12, 14, 16, 18, 20};
+static int powerIndex = 0;
 
-#define I2C_SDA_PIN 4
-#define I2C_SCL_PIN 15
-#define OLED_RST_PIN 16
+TickType_t xLastWakeTime;
+const TickType_t xFrequency = pdMS_TO_TICKS(PERIOD_MS);
+BaseType_t xWasDelayed;
 
-#define ADS_SDA 21
-#define ADS_SCL 22
+void task_monitor_energia() {
+  float shuntvoltage = 0;
+  float busvoltage = 0;
+  float current_mA = 0;
+  float loadvoltage = 0;
+  float power_mW = 0;
 
-// --- Velocidade I2C Segura ---
-// Vamos travar em 100kHz para garantir compatibilidade
-#define I2C_BUS_SPEED 100000
+  shuntvoltage = ina219.getShuntVoltage_mV();
+  busvoltage = ina219.getBusVoltage_V();
+  current_mA = ina219.getCurrent_mA();
+  power_mW = ina219.getPower_mW();
 
-//TwoWire Wire1 = TwoWire(1); // Cria o segundo barramento I2C
+  loadvoltage = busvoltage + (shuntvoltage / 1000);
+  power_mW = loadvoltage * current_mA;
 
-// Crie o objeto u8g2
-//U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* rst=*/ OLED_RST_PIN);
-U8G2_SSD1306_128X64_NONAME_F_SW_I2C u8g2(U8G2_R0, /* clock=*/ I2C_SCL_PIN, /* data=*/ I2C_SDA_PIN, /* reset=*/ OLED_RST_PIN);
 
-#define USE_SERIAL 1
+  total_mA += current_mA;
+  total_sec += 1;
+  float total_mAH = total_mA / 3600.0;
+  (void)total_mAH;
+  serial.printf("\n----------------------------\nV: %.3f , A: %.3f, P: %.3f\n----------------------------\n", loadvoltage, current_mA, power_mW);
+}
 
-// Variável global para o offset. Agora é FLOAT.
-float ADC_OFFSET_ZERO = 0.0; // Palpite inicial para modo diferencial
-float filtered_I_last = 0.0; // Armazena a última amostra filtrada
+/**
+ * @brief Gerencia a lógica do teste de varredura de SF e Potência.
+ * * Esta função é chamada a cada ciclo do loop principal.
+ * 1. Define o Spreading Factor (SF) com base no contador global 'packet_counter'.
+ * 2. Ao final de 30 pacotes (packet_counter >= 30), avança para o próximo nível de potência.
+ * 3. Aplica a configuração de potência (setTxPower) para o ciclo atual.
+ * @return O valor da potência (em dBm) configurada para este ciclo.
+ */
+int8_t configureTransmissionParams(void) {
 
-const uint16_t N_AMOSTRAS_REAIS = 860; // Suas amostras
-const uint16_t N_AMOSTRAS_FFT = 1024;  // Próxima potência de 2 (para o padding)
+  // Configura e verifica potência atual
+  int8_t current_power = testPowers[powerIndex];
+  int16_t pwr_state = node.setTxPower(current_power);
 
-// Arrays para a FFT (precisam ser globais ou static)
-double vReal[N_AMOSTRAS_FFT];
-double vImag[N_AMOSTRAS_FFT];
+  if (pwr_state == RADIOLIB_ERR_NONE) {
+    serial.printf("Potencia ACEITA: %d dBm\n", current_power);
+  } else {
+      serial.printf("----------------------Potencia REJEITADA: %d dBm (Erro: %d)\n", current_power, pwr_state);
+      delay(2000);
+  }
 
-// Instância da FFT
-// (TAXA_SPS não é mais 860. A taxa "efetiva" da FFT mudou)
-// Taxa_SPS_FFT = TAXA_SPS_ADC * (N_AMOSTRAS_FFT / N_AMOSTRAS_REAIS)
-// Taxa_SPS_FFT = 860 * (1024 / 860) = 1024 SPS
-ArduinoFFT<double> FFT = ArduinoFFT<double>(vReal, vImag, N_AMOSTRAS_FFT, 860);
+  /**
+   * @brief Gerencia a varredura intercalada de SF e o ciclo de Potência.
+   * * 1. Usa packet_counter % 3 para intercalar: 0->SF7, 1->SF9, 2->SF12.
+   * 2. Ao atingir 300 pacotes (100 de cada SF), avança a potência.
+   */
+  
+  uint8_t sf_cycle = packet_counter % 3;
+
+  if (sf_cycle == 0) {
+    node.setDatarate(DR_SF7);
+    serial.println("-> Modulacao atual: SF7");
+  }
+  else if (sf_cycle == 1) {
+    node.setDatarate(DR_SF9);
+    serial.println("-> Modulacao atual: SF9");
+  }
+  else if (sf_cycle == 2) {
+    node.setDatarate(DR_SF12);
+    serial.println("-> Modulacao atual: SF12");
+  }
+
+  return current_power;
+}
 
 void setup() { 
   SetupBoard();
   SerialInit();
   RadioBeginSPI();
+  delay(5000);
 
-  // --- 1. Acorde o Display (Exatamente como o Scanner fez) ---
-  // Isso é essencial ANTES de iniciar o I2C
-  pinMode(OLED_RST_PIN, OUTPUT);
-  digitalWrite(OLED_RST_PIN, LOW);
-  delay(20);
-  digitalWrite(OLED_RST_PIN, HIGH);
-  delay(20);
-  Serial.println("Display (pino 16) acordado.");
-
-  // --- 2. Inicie o I2C (Barramento 'Wire') ---
-  // Especifique os pinos e TRAVE a velocidade
-  Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
-  Wire.setClock(I2C_BUS_SPEED);
-  u8g2.setBusClock(I2C_BUS_SPEED);
-  u8g2.begin();
   /*
-  // --- INICIALIZE O DISPLAY AQUI ---
-  u8g2.begin();
-  u8g2.enableUTF8Print(); // Habilita o print de caracteres UTF-8
-  u8g2.setFont(u8g2_font_ncenB08_tr); // Define uma fonte
-  u8g2.clearBuffer();
-  u8g2.setCursor(0, 10);
-  u8g2.print("Display OK!");
-  u8g2.sendBuffer(); // Envia o buffer para a tela
-  delay(1000);
-  // ----------------------------------
+  Wire.begin(I2C_SDA, I2C_SCL);
+
+  if (!ina219.begin(&Wire)) {
+    while(1) {
+      serial.println("ERROR: INA219 Initialise");
+      delay(1000);
+    }
+  }
+  serial.println("Initialise the INA219");
+  
+  // Otimização: Configurar para 32V / 1A caso o consumo seja baixo,
+  // ou manter o padrão de 32V / 2A.
+  ina219.setCalibration_32V_1A();
   */
-  pinMode(LED_BUILTIN, OUTPUT);
-  digitalWrite(LED_BUILTIN, HIGH);
-  //                                                                ADS1015  ADS1115
-  //                                                                -------  -------
-  // ads.setGain(GAIN_TWOTHIRDS);  // 2/3x gain +/- 6.144V  1 bit = 3mV      0.1875mV (default)
-  // ads.setGain(GAIN_ONE);        // 1x gain   +/- 4.096V  1 bit = 2mV      0.125mV
-  // ads.setGain(GAIN_TWO);        // 2x gain   +/- 2.048V  1 bit = 1mV      0.0625mV
-  // ads.setGain(GAIN_FOUR);       // 4x gain   +/- 1.024V  1 bit = 0.5mV    0.03125mV
-  // ads.setGain(GAIN_EIGHT);      // 8x gain   +/- 0.512V  1 bit = 0.25mV   0.015625mV
-  // ads.setGain(GAIN_SIXTEEN);    // 16x gain  +/- 0.256V  1 bit = 0.125mV  0.0078125mV
-  ads.setGain(GAIN_TWO);         // 2x gain   +/- 2.048V  1 bit =     0.0625mV
-  Wire1.begin(ADS_SDA, ADS_SCL, 100000); // 100kHz
-  ads.begin(0x48, &Wire1);
-  ads.setDataRate(RATE_ADS1115_860SPS);
-  delay(5000);  // Give time to switch to the serial monitor
-  serial.println("\nSetup ... ");
+  
+  serial.println("\n--- INICIO DO TESTE DE EFICIENCIA ---");
   serial.println("Initialise the radio");
+  
   int state = radio.begin();
   debug(state != RADIOLIB_ERR_NONE, F("Initialise radio failed"), state, true);
-  serial.println(F("Initialise LoRaWAN Network credentials"));
-  node.setDutyCycle(false);
-  node.setDwellTime(false);
+
+  uint8_t ocpCurrent = 140; // mA
+  int ocpState = radio.setCurrentLimit(ocpCurrent);
+  if (ocpState != RADIOLIB_ERR_NONE) {
+    serial.printf("Aviso: Falha ao ajustar limite de corrente (OCP): %d\n", ocpState);
+  } else {
+    serial.printf("Limite de Corrente (OCP) configurado para %dmA.\n", ocpCurrent);
+  }
+
+  int8_t phyPower = 20; // dBm
+  int phy_state = radio.setOutputPower(phyPower); 
+  if (phy_state != RADIOLIB_ERR_NONE) {
+    serial.printf("Erro ao ativar PA_BOOST: %d\n", phy_state);
+  } else {
+    serial.printf("PA_BOOST Ativado (%d dBm liberado fisicamente).\n", phyPower);
+  }
+
+  serial.printf("Initialise LoRaWAN Network credentials\n\r");
+  
+  /* Configurando autenticação ABP no nó LoRa */
   node.beginABP(devAddr, NULL, NULL, nwkSEncKey, appSKey);
   node.activateABP();
-  debug(state != RADIOLIB_ERR_NONE, F("Activate ABP failed"), state, true);
+  node.setADR(false);
+  node.setDutyCycle(false);
+  node.setDwellTime(false);
+  
+  serial.printf("DEVADDR: 0x%x\n\r", node.getDevAddr());
   serial.println(F("Ready!\n"));
-  serial.printf("0x%x\n\r", node.getDevAddr());
 
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_7x13_tf);
-  u8g2.drawStr((64-strlen("Display OK!"))/2, 40, "Display OK!");
-  u8g2.sendBuffer();
-  //delay(500);
-  delay(500);
-  u8g2.clearBuffer();
+  uint8_t uplinkPayload[242];
+  snprintf((char*) uplinkPayload, sizeof(uplinkPayload), "%s", (char*)"ERROR:RESET");
+  uint8_t size = strlen((char*) uplinkPayload);
+  int state_ini = node.sendReceive(uplinkPayload, size);
+
+  xLastWakeTime = xTaskGetTickCount();
 }
-
-float v_burden[AMOSTRAS] = {};
-
-float maior_f = -MAXFLOAT;
-float menor_f = MAXFLOAT;
 
 void loop() { 
-  serial.printf("\nSending uplink\n\r");
+  serial.printf("\n--- Pacote %d (Ciclo atual) ---\n", packet_counter);
 
-  node.setDatarate(DR_SF7);
+  // 1. Executa a lógica: Configura rádio e incrementa packet_counter internamente
+  int8_t txPower = configureTransmissionParams();
 
-  /*
-  if(counter < 1000) {
-    node.setDatarate(DR_SF7);
-    serial.printf("Set SF for SF7\n\r");
-  } else if ( counter < 2000) {
-    node.setDatarate(DR_SF8);
-    serial.printf("Set SF for SF9\n\r");
-  } else if (counter < 3000) {
-    node.setDatarate(DR_SF9);
-    serial.printf("Set SF for SF12\n\r");
-  } else if (counter < 4000) {
-    node.setDatarate(DR_SF10);
-    serial.printf("Set SF for SF12\n\r");
-  } else if (counter < 5000) {
-    node.setDatarate(DR_SF11);
-    serial.printf("Set SF for SF12\n\r");
-  } else if (counter < 6000) {
-    node.setDatarate(DR_SF12);
-    serial.printf("Set SF for SF12\n\r");
-  } 
-  else {
-    node.setDatarate(DR_SF7);
-    serial.printf("Set SF for SF7\n\r");
-    counter = 0;
-  }
-  */
-
-  float frequency;
-  Int_calculada = med_Ieficaz(&frequency);
-  Serial.println(Int_calculada);
-  Int_calculada = Int_calculada; // é multiplicado por um valor de correção baseado em medições reais
-  Peficaz = Int_calculada * VOLTRED;  //P=V*I
-
-  Serial.printf("%.6f", Int_calculada);
-  Serial.println(" A");
-  Serial.print(Peficaz);
-  Serial.println(" W");
-
-  if (frequency > maior_f) {
-    maior_f = frequency;
-  }
-
-  if (frequency < menor_f) {
-    menor_f = frequency;
-  }
-
-  if(frequency < 59) {
-    Serial.printf("error frequency: %.6f\n", frequency);
-    while(0){
-    }
-  }
-
-  Serial.printf("M: %.6f > Avg: %.6f > M: %.6f\n", maior_f, frequency, menor_f);
-
-
-  //u8g2.clearBuffer();
-  char buffer[65];
-
-  u8g2.clearBuffer();
-
-  size_t buffer_size = 0;
-  sprintf(buffer+buffer_size, "F: %.6f Hz", frequency);
-  u8g2.drawStr(0, 16, buffer+buffer_size);
-  
-  buffer_size = strlen(buffer);
-  sprintf(buffer+buffer_size, "I: %.6f A", Int_calculada);
-  u8g2.drawStr(0, 32, buffer+buffer_size);
-
-  buffer_size = strlen(buffer);
-  sprintf(buffer+buffer_size, "P: %.6f W", Peficaz);
-  u8g2.drawStr(0, 48, buffer+buffer_size);
-
-  buffer_size = strlen(buffer);
-  sprintf(buffer+buffer_size, "V: %.6f V", Int_calculada+300);
-  u8g2.drawStr(0, 64, buffer+buffer_size);
-  Serial.printf("4size: %ld\nsize+buffer: %ld\n", strlen(buffer), strlen(buffer+buffer_size));
-  printf("I = %.6f\nP = %.6f\nP*0,7 = %.6f\nP*0,9 = %.6f\n", Int_calculada, Peficaz, Peficaz*0.7f, Peficaz*0.9f);
-
-  u8g2.sendBuffer(); 
-  //delay(500);
-
-  /*
-  for(int i = 0; i< N_AMOSTRAS_FFT;i++){
-    Serial.printf("%lf ", vReal[i]/860);
-  }
-  Serial.println("\n fim vReal");
-  */
-
-  // Build payload byte array
+  // 2. Prepara o payload
   uint8_t uplinkPayload[242];
-  char message[100];
-  //Int_calculada = 0.000121;
-  //float valor = 2.32;
-  snprintf(message, sizeof(message), "c|%f", Int_calculada);
-  //snprintf(message + strlen(message), sizeof(message), "%f", valor);
-  //printf("message: %s\nsizeof: %ld\n", message, strlen(message));
-  serial.println(message);
-  strcpy((char*) uplinkPayload, message);
-  // Reseta contador do pluviômetro
-  // Perform an uplink
-  /*
-  int state = node.sendReceive(uplinkPayload, strlen((char*) uplinkPayload));
-  debug(state < RADIOLIB_ERR_NONE, F("Error in sendReceive"), state, false);
-  counter++;
-  // Check if a downlink was received 
-  // (state 0 = no downlink, state 1/2 = downlink in window Rx1/Rx2)
-  if(state > 0) {
-    serial.println(F("Received a downlink"));
+  snprintf((char*) uplinkPayload, sizeof(uplinkPayload), "pkt|%3.lu|pwr|%2.d", packet_counter, (int)txPower);
+  uint8_t size = strlen((char*) uplinkPayload);
+  
+  serial.printf("Packet: %s\n", (char*) uplinkPayload);
+
+  int state = node.sendReceive(uplinkPayload, size);
+  
+  if (state == RADIOLIB_ERR_NONE) {
+     serial.println(F("Envio OK (Sem downlink)"));
+  } else if(state > 0) {
+     serial.println(F("Envio OK (Downlink recebido)"));
   } else {
-    serial.println("No downlink received");
+     debug(true, F("Error in sendReceive"), state, false);
   }
-  */
-  // Wait until next uplink - observing legal & TTN FUP constraints
-  delay(uplinkIntervalSeconds * 0);
-}
 
-float med_Ieficaz(float* frequency) {                         
-  int16_t bitsads;
-  float mVporbit = 0.0625F;
-  float Ieficaz;
-  float Iinstant;
-  float mVinstant;
-  float sumIinstant=0;
-  
-  // cruzamento
-  int16_t valorAnterior = 0;
-  /*
-  bool primeiraCruzada = true;
-  double tZeroAnterior = 0, tZeroAtual = 0;
-  */
-  // --- controle de zero crossings ---
-  const int N_CICLOS = 10; // quantos ciclos usar na média
-  /* media simples*/
-  int ciclosDetectados = 0;
-  double tZeroInicial = 0, tZeroFinal = 0;
-  bool primeiraCruzada = true;
+  // 5. Medição de Tempo no Ar
+  RadioLibTime_t timeOnAir = node.getLastToA();
+  serial.printf("Time on Air: %lu ms\n", timeOnAir);
 
-  /* media movel
-  */
-  double periodos_us[N_CICLOS];
-  int idxPeriodo = 0;
-  bool bufferCheio = false;
+  packet_counter++;
 
-  
-  float freq = 0.0;
+  if (packet_counter >= 450) {
+    node.setDatarate(DR_SF7);
+    serial.println("Set SF for SF7");
 
-  // Constante do filtro passa-baixa (LPF). 
-  // 0.1 = filtro forte. 0.5 = filtro médio. 0.9 = filtro fraco.
-  // Comece com um valor médio e ajuste
-  const float ALPHA_LPF = 0.7;
-  
-  // Constante do filtro (alpha). 
-  // Um valor menor = filtro mais lento e estável (bom).
-  const float ALPHA_FILTRO_OFFSET = 0.001;
+    packet_counter = 0;
 
-  long sample_interval_us = (1000*1000) / 860; // Aprox. 1163 µs
-  long next_sample_time = micros();
-  
-  ads.startADCReading(ADS1X15_REG_CONFIG_MUX_DIFF_0_1, /*continuous=*/true);
-  float tempoinicio = millis();                       // para medir quanto tempo leva para realizar as medições
-
-  for (int i = 0; i < AMOSTRAS; i++) {
-    //bitsads = ads.readADC_Differential_0_1();
-    // 2. Espere até o momento da próxima amostra
-    while (micros() < next_sample_time) {
-      // Loop de espera ativa.
-      // Em um sistema mais avançado, o MCU poderia dormir aqui.
-    }
-    unsigned long t2 = micros();
-    // Define o tempo para a *próxima* amostra
-    next_sample_time += sample_interval_us;
-
-    bitsads = ads.getLastConversionResults();
-
-    // --- DETECÇÃO DE CRUZAMENTO DE ZERO ---
-    // --- Detecção de zero cross ---
-    if ((valorAnterior < 0 && bitsads >= 0)) {
-      float y1 = valorAnterior;
-      float y2 = bitsads;
-      unsigned long t1 = t2 - sample_interval_us;
-
-      double frac = (0 - y1) / (y2 - y1);
-      double tZero = t1 + frac * (t2 - t1);
-
-      //Serial.printf("[t1: %lu]\n", t1);
-
-      /*
-      if (!primeiraCruzada) {
-        double periodo_us = tZero - tZeroAnterior;
-        freq = 1e6 / periodo_us;
-      } else {
-        primeiraCruzada = false;
-      }
-
-      tZeroAnterior = tZero;
-      */
-
-      /* media simples
-      if (primeiraCruzada) {
-        tZeroInicial = tZero;
-        primeiraCruzada = false;
-      } else {
-        ciclosDetectados++;
-        tZeroFinal = tZero;
-
-        // Quando atingir N_CICLOS, calcula a média
-        if (ciclosDetectados >= N_CICLOS) {
-          double periodoMedio_us = (tZeroFinal - tZeroInicial) / N_CICLOS;
-          freq = 1e6 / periodoMedio_us;
-          
-          // Reinicia contagem para estabilizar continuamente
-          ciclosDetectados = 0;
-          tZeroInicial = tZeroFinal;
-        }
-      }
-      */
-      /* media movel
-      */
-      if (primeiraCruzada) {
-        tZeroInicial = tZero;
-        primeiraCruzada = false;
-      } else {
-        double periodo_us = tZero - tZeroInicial;
-        tZeroInicial = tZero;
-
-        // Armazena no buffer circular
-        periodos_us[idxPeriodo] = periodo_us;
-        idxPeriodo = (idxPeriodo + 1) % N_CICLOS;
-        if (idxPeriodo == 0) bufferCheio = true;
-
-        // Calcula média móvel
-        double soma = 0;
-        int n = bufferCheio ? N_CICLOS : idxPeriodo;
-        for (int j = 0; j < n; j++) soma += periodos_us[j];
-        double periodoMedio_us = soma / n;
-
-        freq = 1e6 / periodoMedio_us;
-      }
-    }
-
-    valorAnterior = bitsads;
-    // --- DETECÇÃO DE CRUZAMENTO DE ZERO ---
+    serial.println("--- CICLO DE 90 PACOTES CONCLUIDO ---");
+    serial.println("--- AVANCANDO PARA PROXIMA POTENCIA ---");
+    powerIndex++; 
     
-    // 2. ATUALIZA O OFFSET (A MÁGICA)
-    // O offset atual é 99.9% do valor antigo + 0.1% do novo valor
-    ADC_OFFSET_ZERO = (ADC_OFFSET_ZERO * (1.0 - ALPHA_FILTRO_OFFSET)) + (bitsads * ALPHA_FILTRO_OFFSET);
-    //Serial.printf("o: %.6f ", ADC_OFFSET_ZERO);
-
-    mVinstant = (bitsads - ADC_OFFSET_ZERO) * (mVporbit/1000);
-    Iinstant = mVinstant/200;   // regra de três baseada no sensor conectado já que o sensor oferece tensão e a passamos diretamente proporcional à intensidade
-    Iinstant *= 2000; 
-
-    // --- Etapa 3: Aplicar o LPF (Remover Ruído de HF) ---
-    float I_filtrado = (Iinstant * ALPHA_LPF) + (filtered_I_last * (1.0 - ALPHA_LPF));
-    filtered_I_last = I_filtrado; // Salva o valor atual para a próxima iteração
-
-    //v_burden[i] = Iinstant;
-    vReal[i] = I_filtrado; // Armazena o valor em Amperes no array da FFT
-    vImag[i] = 0;        // Zera o array imaginário
-    sumIinstant += sq(I_filtrado);                   // soma dos quadrados
-  }
-  
-  Ieficaz = sqrt(sumIinstant / AMOSTRAS);        // raiz quadrada da soma dos quadrados dividida pelo número de amostras
-
-  // 1. Preenche o resto do array da FFT com zeros (Padding)
-  for (int i = N_AMOSTRAS_REAIS; i < N_AMOSTRAS_FFT; i++) {
-    vReal[i] = 0;
-    vImag[i] = 0;
-  }
-  
-  // 2. Executa a FFT no array de 1024 amostras
-  FFT.compute(FFT_FORWARD); 
-  FFT.complexToMagnitude();
-
-  float tempofim = millis();
-
-  Serial.print((tempofim - tempoinicio) / 1000.0);
-  Serial.println(" segundos para medir");
-
-  // Se houve pelo menos dois cruzamentos
-  
-  *frequency = freq;
-
-  return (Ieficaz);
-}
-
-float initial_med_Ieficaz() {                         
-  int16_t bitsads;
-  float mVporbit = 0.0625F;
-  float Ieficaz;
-  float Iinstant;
-  float mVinstant;
-  float sumIinstant=0;
-
-  long sample_interval_us = (1000*1000) / 860; // Aprox. 1163 µs
-  long next_sample_time = micros();
-  
-  ads.startADCReading(ADS1X15_REG_CONFIG_MUX_DIFF_0_1, /*continuous=*/true);
-  
-  float tempoinicio = millis();                       // para medir quanto tempo leva para realizar as medições
-  for (int i = 0; i < AMOSTRAS; i++) {
-    //bitsads = ads.readADC_Differential_0_1();
-    // 2. Espere até o momento da próxima amostra
-    while (micros() < next_sample_time) {
-      // Loop de espera ativa.
-      // Em um sistema mais avançado, o MCU poderia dormir aqui.
+    // Verifica se acabou todas as potências (Fim total do teste)
+    const size_t NUM_POWERS = sizeof(testPowers) / sizeof(testPowers[0]);
+    if (powerIndex >= NUM_POWERS) {
+      powerIndex = 0;
+      serial.println("--- REINICIANDO TESTE COMPLETO (voltando para 5 dBm) ---");
     }
-    // Define o tempo para a *próxima* amostra
-    next_sample_time += sample_interval_us;
-
-    bitsads = ads.getLastConversionResults();
-
-    mVinstant = bitsads * mVporbit;
-    Iinstant = mVinstant * AMAXSENS / MVMAXSENS;   // regra de três baseada no sensor conectado já que o sensor oferece tensão e a passamos diretamente proporcional à intensidade
-    sumIinstant += sq(Iinstant);                   // soma dos quadrados
+    else {
+      serial.printf("--- AVANCANDO PARA %d dBm ---\n", testPowers[powerIndex]);
+    }
   }
-  float tempofim = millis();
 
-  Ieficaz = sqrt(sumIinstant / AMOSTRAS);        // raiz quadrada da soma dos quadrados dividida pelo número de amostras
+  //task_monitor_energia();
 
-  Serial.print((tempofim - tempoinicio) / 1000.0);
-  Serial.println(" segundos para medir");
-  return (Ieficaz);
+  xWasDelayed = xTaskDelayUntil(&xLastWakeTime, xFrequency);
+
+  if (xWasDelayed == pdFALSE) {
+    // warnning
+    serial.println("Tempo de computação maior que o período");
+  }
 }
